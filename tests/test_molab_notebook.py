@@ -1,5 +1,6 @@
 """Exercise notebook subprocess logging without marimo, network, data or model."""
 import ast
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -9,8 +10,9 @@ import unittest
 
 
 def load_stream_command():
-    path = Path(__file__).resolve().parents[1] / "notebooks/molab_gemma4.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    path = Path(__file__).resolve().parents[1] / "scripts/molab_benchmark.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     function = next(node for node in ast.walk(tree)
                     if isinstance(node, ast.FunctionDef) and node.name == "stream_command")
     scope = {}
@@ -64,6 +66,26 @@ print('finished', flush=True)
         with self.assertRaises(subprocess.TimeoutExpired):
             self.run_command("import time; time.sleep(30)", lambda message: None,
                              timeout=.1, heartbeat_seconds=.05)
+
+    def test_notebook_only_loads_and_calls_github_script(self):
+        path = Path(__file__).resolve().parents[1] / "notebooks/molab_gemma4.ipynb"
+        notebook = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(notebook["nbformat"], 4)
+        sources = []
+        for cell in notebook["cells"]:
+            if cell["cell_type"] == "code":
+                self.assertIsNone(cell["execution_count"])
+                self.assertEqual(cell["outputs"], [])
+                source = "".join(cell["source"])
+                ast.parse(source)
+                sources.append(source)
+        source = "\n".join(sources)
+        self.assertLess(len(source.splitlines()), 60)
+        self.assertIn("raw.githubusercontent.com", source)
+        self.assertIn("/scripts/molab_benchmark.py", source)
+        self.assertIn("benchmark.run_from_notebook(CONFIG", source)
+        self.assertNotIn("def run_benchmark(", source)
+        self.assertNotIn("import marimo", source)
 
 
 if __name__ == "__main__":
