@@ -46,6 +46,21 @@ python -m pip install 'marimo>=0.19,<1' 'huggingface-hub>=0.34,<2' 'Pillow>=10,<
 - Bấm **Chạy benchmark**. Lần đầu tải model khoảng 34 GB, cùng toàn bộ dataset.
 - Tải ZIP kết quả trước khi runtime bị thu hồi.
 
+Sau khi bấm nút, dòng **Đã nhận lệnh Chạy benchmark** phải hiện ngay trong cell
+chạy. Các bước có timestamp UTC; stdout/stderr của plan, pull model, extraction
+và evaluation được in trực tiếp, đồng thời lưu file. Khi subprocess chưa in gì,
+notebook báo vẫn đang chạy mỗi 15 giây. Tải file Ollama/code báo dung lượng mỗi
+10 giây khi nhận được dữ liệu; tải HF dùng progress sẵn có của thư viện. Bước nạp
+model vào GPU có timeout 1800 giây và thông báo đường dẫn server log.
+
+Nếu lỗi, màn hình hiện traceback và 15 dòng cuối các log liên quan; lỗi từng hóa
+đơn cũng được liệt kê sau trích xuất. Lỗi dependency/cấu hình trước khi tạo thư
+mục kết quả cũng được in ngay. Không cần đợi tải ZIP mới biết nguyên nhân.
+
+Nếu đã mở notebook cũ trên Molab, chỉ push code lên GitHub sẽ không cập nhật file
+notebook đang mở. Import lại bản `notebooks/molab_gemma4.py` mới để nhận thay đổi
+giao diện/log, sau đó chạy các cell và bấm nút. Khi chưa bấm nút thì chưa chạy model.
+
 Notebook resolve GitHub/HF revision thành commit SHA trước khi tải; model digest
 được ghi trong predictions và danh sách model của run manifest. Có thể nhập commit
 SHA cho các lần chạy lặp lại. Ollama mặc định `latest` dùng lại bản đã tải trong

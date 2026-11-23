@@ -17,7 +17,7 @@ def _():
 
 @app.cell
 def _(mo):
-    mo.md("""
+    mo.output.append(mo.md("""
     # Invoice OCR — Gemma 4 trên Molab
 
     Chọn runtime **Linux / NVIDIA GPU**. Notebook lấy code từ GitHub và **toàn bộ
@@ -30,7 +30,7 @@ def _(mo):
 
     **Bấm Chạy benchmark mới tải dữ liệu, tải model và chạy GPU.** Lần đầu tải
     model Q8 khoảng 34 GB. Nên chạy thử 3 hóa đơn trước khi chạy toàn bộ.
-    """)
+    """))
     return
 
 
@@ -52,12 +52,85 @@ def _(mo):
         "max_edge": mo.ui.number(start=512, stop=4096, step=128, value=1600, label="Cạnh ảnh tối đa (px)"),
         "timeout": mo.ui.number(start=60, stop=7200, step=60, value=1800, label="Timeout mỗi hóa đơn (giây)"),
     }).form(submit_button_label="Chạy benchmark", clear_on_submit=False)
-    settings
+    mo.output.append(settings)
     return (settings,)
 
 
 @app.cell
 def _():
+    def stream_command(args, log_path, emit, *, cwd, env, timeout=None,
+                       heartbeat_seconds=15, emit_interval=0):
+        """Drain merged stdout/stderr live; keep heartbeat and clean up on interruption."""
+        import queue
+        import re
+        import subprocess
+        import threading
+        import time
+
+        events = queue.Queue()
+        process = subprocess.Popen(args, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                   errors="replace", bufsize=1)
+
+        def read_output():
+            try:
+                for line in process.stdout:
+                    events.put(line)
+            finally:
+                events.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        started = time.monotonic()
+        last_heartbeat = started
+        last_emit = float("-inf")
+        pending = None
+        try:
+            with log_path.open("w", encoding="utf-8", buffering=1) as log:
+                while True:
+                    now = time.monotonic()
+                    if timeout is not None and now - started > timeout:
+                        raise subprocess.TimeoutExpired(args, timeout)
+                    try:
+                        item = events.get(timeout=min(1, heartbeat_seconds))
+                    except queue.Empty:
+                        item = ""
+                    if item is None:
+                        if pending:
+                            emit(f"[{log_path.name}] {pending}")
+                        break
+                    if item:
+                        clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", item).strip()
+                        log.write(clean + "\n")
+                        if clean:
+                            pending = clean
+                    now = time.monotonic()
+                    if pending and now - last_emit >= emit_interval:
+                        emit(f"[{log_path.name}] {pending}")
+                        pending = None
+                        last_emit = now
+                    if now - last_heartbeat >= heartbeat_seconds:
+                        emit(f"[{log_path.name}] vẫn đang chạy — {now - started:.0f}s")
+                        last_heartbeat = now
+                code = process.wait(timeout=15)
+            emit(f"[{log_path.name}] kết thúc, exit code = {code}")
+            return code
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            reader.join(timeout=2)
+            process.stdout.close()
+
+    return (stream_command,)
+
+
+@app.cell
+def _(stream_command):
     def run_benchmark(config, progress):
         """Isolate downloaded project imports in subprocesses, not the notebook kernel."""
         import csv
@@ -72,6 +145,7 @@ def _():
         import sys
         import tarfile
         import time
+        import traceback
         import uuid
         import zipfile
         from datetime import datetime, timezone
@@ -124,9 +198,12 @@ def _():
             (output / "run_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
         def stage(message):
-            progress(message)
+            message = redact(message)
+            stamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+            message = f"[{stamp}] {message}"
             with (output / "progress.log").open("a", encoding="utf-8") as stream:
                 stream.write(message + "\n")
+            progress(message)
 
         # Credentials are deliberately absent from model and CLI subprocess environments.
         child_env = {k: v for k, v in os.environ.items()
@@ -134,17 +211,37 @@ def _():
         child_env["PYTHONUNBUFFERED"] = "1"
 
         def command(args, log_name, *, env=None, timeout=None):
-            with (output / log_name).open("w", encoding="utf-8") as log:
-                result = subprocess.run(args, cwd=checkout if checkout.exists() else run,
-                                        env=env or child_env, stdout=log, stderr=subprocess.STDOUT,
-                                        text=True, timeout=timeout)
-            return result.returncode
+            def relay(message):
+                stage(message)
+                if log_name == "extract.log" and "] error " in message:
+                    prediction_path = Path(message.split("] error ", 1)[1])
+                    if prediction_path.parent.resolve() == (output / "predictions").resolve() and prediction_path.is_file():
+                        try:
+                            prediction = json.loads(prediction_path.read_text(encoding="utf-8-sig"))
+                            stage(f"LỖI hóa đơn {prediction.get('document_id')}: {prediction.get('error', 'unknown error')}")
+                        except (ValueError, OSError):
+                            pass  # Raw subprocess output is still available if diagnostics cannot be read.
+            return stream_command(args, output / log_name, relay,
+                                  cwd=checkout if checkout.exists() else run,
+                                  env=env or child_env, timeout=timeout,
+                                  emit_interval=1 if log_name == "model-pull.log" else 0)
 
         def download(url, destination, headers=None):
             temporary = destination.with_suffix(destination.suffix + ".part")
+            stage(f"Bắt đầu tải {destination.name}")
             with urlopen(Request(url, headers=headers or {}), timeout=120) as response, temporary.open("wb") as target:
-                shutil.copyfileobj(response, target)
+                total = int(response.headers.get("Content-Length", 0))
+                received = 0
+                last_report = time.monotonic()
+                while chunk := response.read(1024 * 1024):
+                    target.write(chunk)
+                    received += len(chunk)
+                    if time.monotonic() - last_report >= 10:
+                        suffix = f" / {total / 2**20:.0f} MiB ({100 * received / total:.1f}%)" if total else " MiB"
+                        stage(f"{destination.name}: {received / 2**20:.0f}" + suffix)
+                        last_report = time.monotonic()
             temporary.replace(destination)
+            stage(f"Đã tải {destination.name}: {received / 2**20:.1f} MiB")
 
         local_http = build_opener(ProxyHandler({}))
 
@@ -155,6 +252,7 @@ def _():
                 return json.load(response)
 
         try:
+            stage(f"Thư mục log/kết quả: {output}")
             stage("1/6 — Kiểm tra GPU")
             gpu = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
                                   "--format=csv,noheader,nounits"], capture_output=True, text=True, check=True)
@@ -175,6 +273,7 @@ def _():
             with urlopen(Request(repo_url + "/commits/" + quote(config["github_ref"], safe=""), headers=headers), timeout=60) as response:
                 code_sha = json.load(response)["sha"]
             manifest["github_commit"] = code_sha
+            stage("GitHub commit: " + code_sha)
             archive = run / "code.zip"
             download(repo_url + "/zipball/" + code_sha, archive, headers)
             checkout.mkdir()
@@ -194,7 +293,9 @@ def _():
                             shutil.copyfileobj(source, dest)
             info = HfApi(token=hf_token).repo_info(config["dataset"], repo_type="dataset", revision=config["dataset_ref"])
             manifest["dataset_commit"] = info.sha
+            stage("HF dataset commit: " + info.sha + "; bắt đầu snapshot_download (xem progress bên dưới)")
             dataset = Path(snapshot_download(repo_id=config["dataset"], repo_type="dataset", revision=info.sha, token=hf_token))
+            stage("Đã tải FULL dataset: " + str(dataset))
             for name in ("data", "data_split", "groundtruth"):
                 source = dataset / name
                 if not source.exists() and name != "data_split":
@@ -241,6 +342,7 @@ def _():
                 url = ("https://ollama.com/download/ollama-linux-amd64.tar.zst" if version == "latest" else
                        f"https://github.com/ollama/ollama/releases/download/v{version}/ollama-linux-amd64.tar.zst")
                 download(url, package)
+                stage("Đang giải nén Ollama")
                 with package.open("rb") as raw, zstandard.ZstdDecompressor().stream_reader(raw) as stream:
                     with tarfile.open(fileobj=stream, mode="r|") as tar:
                         tar.extractall(install, filter="data")
@@ -275,6 +377,7 @@ def _():
                 raise ValueError("Model đã chọn không hỗ trợ ảnh.")
             manifest["model_info"] = shown
             manifest["installed_models"] = api("/api/tags")
+            stage("Đang nạp model vào GPU; tối đa 1800 giây. Log server: " + str(output / "ollama-server.log"))
             api("/api/generate", {"model": config["model"], "prompt": "", "stream": False,
                                   "keep_alive": "30m", "options": {"num_ctx": int(config["num_ctx"])}}, timeout=1800)
             loaded = api("/api/ps").get("models", [])
@@ -284,7 +387,7 @@ def _():
             manifest["status"] = "extracting"
             manifest["prompt_sha256"] = hashlib.sha256((checkout / "prompts/invoice.txt").read_bytes()).hexdigest()
             save_manifest()
-            stage("5/6 — Trích xuất; xem extract.log nếu cần tiến độ từng hóa đơn")
+            stage("5/6 — Trích xuất; log từng hóa đơn sẽ hiện trực tiếp bên dưới")
             extraction_started = time.perf_counter()
             exit_code = command([sys.executable, "-m", "invoice_ocr", "extract", "--env-file", str(env_file),
                                  "--backend", "ollama", "--input", str(input_manifest), "--output", str(output / "predictions"),
@@ -302,6 +405,9 @@ def _():
             manifest["successful"] = sum(p.get("status") == "ok" for p in predictions)
             manifest["failed_or_missing"] = len(selected_lines) - manifest["successful"]
             manifest["inference_seconds"] = round(sum(p.get("inference_seconds", 0) for p in predictions), 3)
+            for prediction in predictions:
+                if prediction.get("status") != "ok":
+                    stage(f"LỖI hóa đơn {prediction.get('document_id')}: {prediction.get('error', 'unknown error')}")
             stage("6/6 — Chấm điểm (hóa đơn lỗi/thiếu vẫn nằm trong mẫu chấm)")
             if command([sys.executable, "-m", "invoice_ocr", "evaluate", "--groundtruth", str(gt),
                         "--predictions", str(prediction_dir), "--output", str(output / "evaluation")], "evaluate.log"):
@@ -313,6 +419,15 @@ def _():
         except Exception as error:
             manifest.update(status="failed", error=redact(f"{type(error).__name__}: {error}"))
             stage("Dừng: " + manifest["error"])
+            stage(redact(traceback.format_exc()))
+            for detail in (getattr(error, "stdout", None), getattr(error, "stderr", None)):
+                if detail:
+                    stage(str(detail))
+            (output / "traceback.log").write_text(redact(traceback.format_exc()), encoding="utf-8")
+            for name in ("plan.log", "model-pull.log", "ollama-server.log", "extract.log", "evaluate.log"):
+                path = output / name
+                if path.is_file():
+                    stage(f"--- {name}: 15 dòng cuối ---\n" + "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]))
         finally:
             if server is not None and server.poll() is None:
                 server.terminate()
@@ -338,8 +453,21 @@ def _():
 @app.cell
 def _(mo, run_benchmark, settings):
     mo.stop(settings.value is None, mo.md("Nhập cấu hình rồi bấm **Chạy benchmark** để bắt đầu."))
-    with mo.status.spinner(title="Benchmark đang chạy; log chi tiết lưu trong thư mục results") as _status:
-        result = run_benchmark(settings.value, lambda message: _status.update(title=message))
+    # Direct output is visible in both editor and app mode; do not hide it behind a spinner.
+    with mo.redirect_stdout(), mo.redirect_stderr():
+        print("Đã nhận lệnh Chạy benchmark. Đang kiểm tra cấu hình...", flush=True)
+        try:
+            result = run_benchmark(settings.value, lambda message: print(message, flush=True))
+        except Exception:
+            import traceback as _traceback
+            import os as _os
+            _details = _traceback.format_exc()
+            for _secret in (settings.value.get("hf_token"), settings.value.get("github_token"),
+                            _os.environ.get("HF_TOKEN"), _os.environ.get("GITHUB_TOKEN")):
+                if _secret:
+                    _details = _details.replace(_secret, "[REDACTED]")
+            print("LỖI trước khi benchmark khởi chạy:\n" + _details, flush=True)
+            mo.stop(True)
     return (result,)
 
 
@@ -347,7 +475,7 @@ def _(mo, run_benchmark, settings):
 def _(mo, result):
     _manifest = result["manifest"]
     _focus = {"purchase_order", "items_rows", "totals.total_payment", "invoice_all_fields", "schema_valid", "all_fields"}
-    mo.vstack([
+    mo.output.append(mo.vstack([
         mo.md(f"""### Kết quả: `{_manifest['status']}`
 
         Hóa đơn chọn: **{_manifest.get('evaluated_documents', 0)}** /
@@ -365,7 +493,7 @@ def _(mo, result):
         mo.ui.table([row for row in result["metrics"] if row["field"] in _focus], label="Các tiêu chí chính"),
         mo.ui.table(result["metrics"], label="Toàn bộ tiêu chí"),
         mo.download(data=result["zip"].read_bytes(), filename="invoice-results.zip", mimetype="application/zip", label="Tải kết quả ZIP"),
-    ])
+    ]))
     return
 
 
