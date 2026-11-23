@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: invoice_ocr
+      POSTGRES_USER: invoice
+      POSTGRES_PASSWORD: ${INVOICE_POSTGRES_PASSWORD:?Set INVOICE_POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${INVOICE_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - invoice_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U invoice -d invoice_ocr"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+volumes:
+  invoice_postgres:

@@ -1,0 +1,4 @@
+-r local.txt
+transformers>=4.57.1,<5
+accelerate>=1.10,<2
+bitsandbytes>=0.48,<1

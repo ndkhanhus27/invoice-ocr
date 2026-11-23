@@ -1,0 +1,4 @@
+-r base.txt
+gradio==6.9.0
+huggingface-hub>=0.34,<1
+pydantic>=2.12.5,<3

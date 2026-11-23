@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "invoice-ocr"
+version = "0.1.0"
+description = "Local invoice extraction, labeling and evaluation"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+invoice-ocr = "invoice_ocr.cli:entrypoint"
+
+[tool.setuptools]
+package-dir = {"" = "src", "app" = "app"}
+packages = ["app", "invoice_ocr", "invoice_ocr.contracts", "invoice_ocr.storage", "invoice_ocr.extraction", "invoice_ocr.extraction.backends", "invoice_ocr.evaluation", "invoice_ocr.labeling"]

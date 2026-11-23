@@ -1,0 +1,37 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+models/
+outputs/
+.env
+.env.*
+!.env.example
+!*.env.example
+.cache/
+tmp/
+
+# Customer documents and generated dataset splits stay local.
+/Invoice High Accuracy v2/
+/data_split/
+/data_split_*/
+
+# Local credentials and editor/system files.
+/kaggle.json
+/.kaggle/
+*.pem
+*.key
+.DS_Store
+Thumbs.db
+
+/invoice-code.zip
+/invoice-valid.zip
+
+# Local invoice labels and embedded document previews.
+/groundtruth/
+
+# Prepared customer images and portable review bundles.
+/data/
+/invoice-reviewed-*.zip
