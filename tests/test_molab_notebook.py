@@ -1,12 +1,15 @@
 """Exercise notebook subprocess logging without marimo, network, data or model."""
 import ast
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 
 def load_stream_command():
@@ -66,6 +69,20 @@ print('finished', flush=True)
         with self.assertRaises(subprocess.TimeoutExpired):
             self.run_command("import time; time.sleep(30)", lambda message: None,
                              timeout=.1, heartbeat_seconds=.05)
+
+    def test_start_message_is_visible_before_token_prompt(self):
+        path = Path(__file__).resolve().parents[1] / "scripts/molab_benchmark.py"
+        scope = {}
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), scope)
+        scope["run_benchmark"] = lambda config, progress: {"status": "mocked"}
+        captured = io.StringIO()
+        def enter_token(prompt):
+            self.assertIn("Đã nhận lệnh chạy benchmark", captured.getvalue())
+            self.assertIn("Đang chờ nhập HF token", captured.getvalue())
+            return "test-placeholder"
+        with patch.dict(os.environ, {}, clear=True), patch("getpass.getpass", side_effect=enter_token), redirect_stdout(captured):
+            self.assertEqual(scope["run_from_notebook"]({}), {"status": "mocked"})
+        self.assertNotIn("test-placeholder", captured.getvalue())
 
     def test_notebook_only_loads_and_calls_github_script(self):
         path = Path(__file__).resolve().parents[1] / "notebooks/molab_gemma4.ipynb"

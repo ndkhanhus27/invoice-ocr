@@ -407,11 +407,15 @@ def run_from_notebook(config, github_token=""):
     import getpass
     import os
     import traceback
-    selected = dict(config)
-    selected["hf_token"] = os.environ.get("HF_TOKEN", "") or getpass.getpass("HF token (ẩn): ")
-    selected["github_token"] = github_token or os.environ.get("GITHUB_TOKEN", "")
     print("Đã nhận lệnh chạy benchmark.", flush=True)
+    selected = dict(config)
+    selected["hf_token"] = os.environ.get("HF_TOKEN", "")
+    selected["github_token"] = github_token or os.environ.get("GITHUB_TOKEN", "")
     try:
+        if not selected["hf_token"]:
+            print("Đang chờ nhập HF token. Nếu không thấy ô nhập, đặt secret HF_TOKEN trong runtime rồi chạy lại cell.", flush=True)
+            selected["hf_token"] = getpass.getpass("HF token (ẩn): ")
+        print("Đã có HF token; bắt đầu kiểm tra GPU và tải dữ liệu.", flush=True)
         return run_benchmark(selected, lambda message: print(message, flush=True))
     except Exception:
         details = traceback.format_exc()
