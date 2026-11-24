@@ -57,6 +57,17 @@ class OriginalBf16Tests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "offload"):
             self.load()
 
+    def test_gemma4_without_hf_device_map_loads_and_logs_actual_devices(self):
+        del self.model.hf_device_map
+        self.model.parameters = lambda: iter([SimpleNamespace(device="cuda:0")])
+        self.assertEqual(self.load(), (self.model, self.processor))
+
+    def test_missing_map_does_not_hide_cpu_parameters(self):
+        del self.model.hf_device_map
+        self.model.parameters = lambda: iter([SimpleNamespace(device="cuda:0"), SimpleNamespace(device="cpu")])
+        with self.assertRaisesRegex(RuntimeError, "offload"):
+            self.load()
+
     def test_legacy_bnb4_loading_still_uses_fp16_compute(self):
         self.args.weights_format = "bnb4"
         self.config.model_type = "mllama"

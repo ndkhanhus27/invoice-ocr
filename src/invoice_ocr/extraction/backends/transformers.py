@@ -137,14 +137,17 @@ def load_model(args):
         raise RuntimeError("Expected original BF16 weights, but a quantized model was loaded")
     if not full_precision and not getattr(model, "is_loaded_in_4bit", False):
         raise RuntimeError("Model was not loaded in 4-bit")
-    if full_precision and any(str(value) in ("cpu", "disk") for value in getattr(model, "hf_device_map", {}).values()):
+    device_map = getattr(model, "hf_device_map", None)
+    devices = ({str(value) for value in device_map.values()} if device_map else
+               {str(parameter.device) for parameter in model.parameters()})
+    if full_precision and (not devices or any(not (value.startswith('cuda') or value.isdigit()) for value in devices)):
         raise RuntimeError("BF16 model must stay on GPU; CPU/disk offload was detected")
     if full_precision and model.dtype != torch.bfloat16:
         raise RuntimeError("Expected BF16 model dtype")
     processor = AutoProcessor.from_pretrained(args.model, **common)
     if config.model_type == "gemma4":
         processor.image_processor.max_soft_tokens = getattr(args, "vision_soft_tokens", 1120)
-    print("Model loaded, format=", "bf16" if full_precision else "bnb4", "map=", model.hf_device_map, flush=True)
+    print("Model loaded, format=", "bf16" if full_precision else "bnb4", "placement=", device_map or sorted(devices), flush=True)
     return model, processor
 
 
