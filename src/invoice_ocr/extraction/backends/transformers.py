@@ -105,21 +105,46 @@ def load_model(args):
     common = {"local_files_only": args.offline, "revision": args.revision}
     config = AutoConfig.from_pretrained(args.model, **common)
     quant = getattr(config, "quantization_config", None)
-    if not isinstance(quant, dict) or not quant.get("load_in_4bit") or quant.get("quant_method") != "bitsandbytes":
-        raise ValueError("Use a pre-quantized BitsAndBytes 4-bit checkpoint")
-    # Override BF16 compute on T4; preserve skip_modules and prequantized metadata.
-    quant["bnb_4bit_compute_dtype"] = "float16"
-    model_class = MllamaForConditionalGeneration if config.model_type == "mllama" else AutoModelForImageTextToText
+    full_precision = getattr(args, "weights_format", "bnb4") == "bf16"
+    if full_precision:
+        if quant:
+            raise ValueError("BF16 requires original unquantized weights, not a quantized checkpoint")
+        if args.device == "auto":
+            raise ValueError("BF16 requires explicit cuda:N; CPU/disk offload is not enabled")
+        with torch.cuda.device(args.device):
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError("Selected GPU does not support BF16")
+        dtype = torch.bfloat16
+    else:
+        if not isinstance(quant, dict) or not quant.get("load_in_4bit") or quant.get("quant_method") != "bitsandbytes":
+            raise ValueError("Use a pre-quantized BitsAndBytes 4-bit checkpoint")
+        # Preserve the existing local/T4 quantized path.
+        quant["bnb_4bit_compute_dtype"] = "float16"
+        dtype = torch.float16
+    if config.model_type == "gemma4":
+        from transformers import Gemma4ForConditionalGeneration
+        model_class = Gemma4ForConditionalGeneration
+    else:
+        model_class = MllamaForConditionalGeneration if config.model_type == "mllama" else AutoModelForImageTextToText
+    print(f"Loading {args.model}, format={'BF16 original' if full_precision else 'bnb4'}, device={args.device}; reading weight shards...", flush=True)
     model = model_class.from_pretrained(
-        args.model, config=config, dtype=torch.float16,
+        args.model, config=config, dtype=dtype,
         device_map="auto" if args.device == "auto" else {"": args.device},
         attn_implementation="sdpa", low_cpu_mem_usage=True,
         **common,
     ).eval()
-    if not getattr(model, "is_loaded_in_4bit", False):
+    if full_precision and (getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False)):
+        raise RuntimeError("Expected original BF16 weights, but a quantized model was loaded")
+    if not full_precision and not getattr(model, "is_loaded_in_4bit", False):
         raise RuntimeError("Model was not loaded in 4-bit")
+    if full_precision and any(str(value) in ("cpu", "disk") for value in getattr(model, "hf_device_map", {}).values()):
+        raise RuntimeError("BF16 model must stay on GPU; CPU/disk offload was detected")
+    if full_precision and model.dtype != torch.bfloat16:
+        raise RuntimeError("Expected BF16 model dtype")
     processor = AutoProcessor.from_pretrained(args.model, **common)
-    print("Model loaded, 4-bit=True, map=", model.hf_device_map, flush=True)
+    if config.model_type == "gemma4":
+        processor.image_processor.max_soft_tokens = getattr(args, "vision_soft_tokens", 1120)
+    print("Model loaded, format=", "bf16" if full_precision else "bnb4", "map=", model.hf_device_map, flush=True)
     return model, processor
 
 
@@ -145,9 +170,14 @@ class TransformersBackend:
         content.append({'type': 'text', 'text': prompt})
         inputs = output = None
         try:
+            gemma4 = getattr(getattr(model, 'config', None), 'model_type', None) == 'gemma4'
+            template_options = {'enable_thinking': False} if gemma4 else {}
             inputs = processor.apply_chat_template([{'role': 'user', 'content': content}], tokenize=True,
-                add_generation_prompt=True, return_dict=True, return_tensors='pt').to(model.device)
-            if getattr(getattr(model, 'config', None), 'model_type', None) == 'mllama':
+                add_generation_prompt=True, return_dict=True, return_tensors='pt', **template_options).to(model.device)
+            maximum = getattr(self.args, 'max_input_tokens', None)
+            if maximum and inputs['input_ids'].shape[-1] > maximum:
+                raise ValueError(f"Invoice input exceeds {maximum} tokens; no pages were dropped. Increase max_input_tokens after checking VRAM.")
+            if gemma4 or getattr(getattr(model, 'config', None), 'model_type', None) == 'mllama':
                 inputs = inputs.to(dtype=model.dtype)
             torch.cuda.synchronize()
             started = time.perf_counter()
@@ -157,6 +187,19 @@ class TransformersBackend:
             inference_seconds = round(time.perf_counter() - started, 3)
             ids = output[0, inputs['input_ids'].shape[1]:]
             text = processor.decode(ids, skip_special_tokens=True)
+            if gemma4:
+                # Gemma may emit an empty thought channel even with thinking disabled.
+                raw = processor.decode(ids, skip_special_tokens=False)
+                if '<|channel>final' in raw:
+                    text = raw.split('<|channel>final', 1)[1]
+                elif '<|channel>thought' in raw and '<channel|>' in raw:
+                    text = raw.split('<channel|>', 1)[1]
+                else:
+                    text = processor.decode(ids, skip_special_tokens=True)
+                text = text.strip()
+                for token in ('<turn|>', '<|turn>', '<eos>', '<end_of_turn>'):
+                    if text.endswith(token):
+                        text = text.removesuffix(token).rstrip()
             return {'done': True, 'done_reason': 'length' if len(ids) >= self.args.max_new_tokens else 'stop',
                     'eval_count': len(ids), 'message': {'content': text}, 'inference_seconds': inference_seconds}
         finally:

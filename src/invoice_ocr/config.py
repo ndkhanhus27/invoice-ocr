@@ -94,7 +94,10 @@ def parse_args(argv=None):
         if name == "extract":
             run.add_argument('--backend', choices=('ollama', 'transformers'), default=setting('BACKEND', 'transformers'))
             ollama_options(run)
-            run.add_argument("--model", default=str(model_dir), help="4-bit Hub ID or local model directory")
+            run.add_argument("--model", default=str(model_dir), help="Hub ID or local model directory")
+            run.add_argument("--weights-format", choices=("bnb4", "bf16"), default=setting("WEIGHTS_FORMAT", "bnb4"))
+            run.add_argument("--max-input-tokens", type=positive, default=setting("MAX_INPUT_TOKENS", None))
+            run.add_argument("--vision-soft-tokens", type=int, choices=(70, 140, 280, 560, 1120), default=setting("VISION_SOFT_TOKENS", "1120"))
             run.add_argument("--revision", default=setting("MODEL_REVISION", "main"))
             run.add_argument("--offline", action=argparse.BooleanOptionalAction,
                              default=env_bool(setting("OFFLINE", "true")))

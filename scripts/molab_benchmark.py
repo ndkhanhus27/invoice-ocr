@@ -145,6 +145,52 @@ def verify_image_files(root, records):
         raise FileNotFoundError(f"Dataset thiếu {len(missing)} ảnh được groundtruth tham chiếu. Ví dụ: {', '.join(missing[:5])}. Upload các ảnh này vào đúng data/<split>/<document_id>/ trên HF rồi chạy lại.")
 
 
+
+def validate_bf16_config(config):
+    if config.get("model") != "google/gemma-4-31B-it":
+        raise ValueError("Notebook này dùng bản gốc google/gemma-4-31B-it. Import notebook BF16 mới, không dùng tên model Ollama cũ.")
+    if config.get("weights_format", "bf16") != "bf16":
+        raise ValueError("Đã chọn bản gốc BF16; không tự đổi sang checkpoint lượng tử hóa.")
+    for key in ("max_tokens", "max_edge", "max_input_tokens", "vision_soft_tokens"):
+        if int(config.get(key, {"max_input_tokens": 8192, "vision_soft_tokens": 1120}.get(key, 0))) < 1:
+            raise ValueError(key + " phải là số nguyên dương.")
+    if int(config.get("vision_soft_tokens", 1120)) not in (70, 140, 280, 560, 1120):
+        raise ValueError("vision_soft_tokens không được hỗ trợ.")
+    if int(config.get("limit", 0)) < 0:
+        raise ValueError("limit phải >= 0.")
+
+
+def runtime_probe():
+    """Probe in a short child so notebook kernel never imports torch or owns model memory."""
+    import json
+    import subprocess
+    import sys
+    snippet = '''import json,torch
+from pathlib import Path
+if not torch.cuda.is_available():
+    raise RuntimeError("PyTorch không truy cập được CUDA; chọn runtime GPU trước.")
+free,total=torch.cuda.mem_get_info(0)
+info={"torch":torch.__version__,"cuda":torch.version.cuda,"gpu":torch.cuda.get_device_name(0),
+      "vram_total_gib":total/1024**3,"vram_free_gib":free/1024**3,"bf16":torch.cuda.is_bf16_supported()}
+for name in ("memory.max","memory.current","memory.events"):
+    path=Path("/sys/fs/cgroup")/name
+    if path.exists(): info[name]=path.read_text().strip()
+print(json.dumps(info))
+'''
+    process = subprocess.run([sys.executable, "-c", snippet], capture_output=True, text=True, timeout=90)
+    if process.returncode:
+        raise RuntimeError("CUDA probe thất bại: " + process.stderr[-3000:])
+    return json.loads(process.stdout.strip().splitlines()[-1])
+
+
+def require_bf16_hardware(hardware):
+    if not hardware.get("bf16"):
+        raise RuntimeError("GPU hiện tại không hỗ trợ BF16.")
+    # Original 31B is about 70 GB before context/runtime headroom. Never CPU-offload on 32 GiB RAM.
+    if hardware.get("vram_free_gib", 0) < 80:
+        raise RuntimeError(f"Gemma 4 31B BF16 cần GPU lớn: yêu cầu tối thiểu 80 GiB VRAM trống trong cấu hình này; đang có {hardware.get('vram_free_gib', 0):.1f} GiB. 32 GiB RAM hệ thống khác với VRAM. Không tự offload CPU hoặc đổi sang 4-bit.")
+
+
 def run_benchmark(config, progress):
     """Isolate downloaded project imports in subprocesses, not the notebook kernel."""
     import csv
@@ -154,10 +200,8 @@ def run_benchmark(config, progress):
     import platform
     import re
     import shutil
-    import socket
     import subprocess
     import sys
-    import tarfile
     import time
     import traceback
     import uuid
@@ -165,22 +209,15 @@ def run_benchmark(config, progress):
     from datetime import datetime, timezone
     from pathlib import Path
     from urllib.parse import quote
-    from urllib.request import Request, build_opener, ProxyHandler, urlopen
+    from urllib.request import Request, urlopen
 
     from huggingface_hub import HfApi, snapshot_download
-    import zstandard
 
     if platform.system() != "Linux" or platform.machine() not in ("x86_64", "amd64"):
         raise RuntimeError("Notebook này cần Molab Linux x86_64 và NVIDIA GPU.")
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", config["github_repo"]):
         raise ValueError("GitHub repo cần có dạng owner/repo.")
-    if not re.fullmatch(r"[\w./:-]+", config["model"]) or "cloud" in config["model"].lower():
-        raise ValueError("Chọn tên model Ollama local, không dùng model cloud.")
-    if config["max_tokens"] >= config["num_ctx"]:
-        raise ValueError("Output token limit phải nhỏ hơn context để còn chỗ cho ảnh và prompt.")
-    version = config["ollama_version"].strip().removeprefix("v")
-    if version != "latest" and not re.fullmatch(r"\d+\.\d+\.\d+(?:[-.\w]*)?", version):
-        raise ValueError("Ollama version phải là latest hoặc số release, ví dụ 0.x.y.")
+    validate_bf16_config(config)
     hf_token = config["hf_token"].strip() or os.environ.get("HF_TOKEN")
     gh_token = config["github_token"].strip() or os.environ.get("GITHUB_TOKEN")
     if not hf_token:
@@ -198,13 +235,11 @@ def run_benchmark(config, progress):
     run = cache / "runs" / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8])
     run.mkdir(parents=True)
     checkout = run / "code"
-    output = run / "results"
-    output.mkdir()
+    output = Path.cwd() / "invoice-results" / run.name / "results"
+    output.mkdir(parents=True)
     manifest = {"status": "preparing", "started_utc": datetime.now(timezone.utc).isoformat(),
                 "config": {k: v for k, v in config.items() if k not in ("hf_token", "github_token")},
                 "python": sys.version, "platform": platform.platform()}
-    server = None
-    server_log = None
     started = time.perf_counter()
     metrics = []
 
@@ -217,6 +252,8 @@ def run_benchmark(config, progress):
         message = f"[{stamp}] {message}"
         with (output / "progress.log").open("a", encoding="utf-8") as stream:
             stream.write(message + "\n")
+        manifest["last_progress"] = message
+        save_manifest()
         progress(message)
 
     # Credentials are deliberately absent from model and CLI subprocess environments.
@@ -238,7 +275,7 @@ def run_benchmark(config, progress):
         return stream_command(args, output / log_name, relay,
                               cwd=checkout if checkout.exists() else run,
                               env=env or child_env, timeout=timeout,
-                              emit_interval=1 if log_name == "model-pull.log" else 0)
+                              emit_interval=0)
 
     def download(url, destination, headers=None):
         temporary = destination.with_suffix(destination.suffix + ".part")
@@ -257,29 +294,14 @@ def run_benchmark(config, progress):
         temporary.replace(destination)
         stage(f"Đã tải {destination.name}: {received / 2**20:.1f} MiB")
 
-    local_http = build_opener(ProxyHandler({}))
-
-    def api(path, body=None, timeout=60):
-        data = json.dumps(body).encode() if body is not None else None
-        request = Request(base_url + path, data=data, headers={"Content-Type": "application/json"})
-        with local_http.open(request, timeout=timeout) as response:
-            return json.load(response)
-
     try:
         stage(f"Thư mục log/kết quả: {output}")
-        stage("1/6 — Kiểm tra GPU")
-        gpu = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.free",
-                              "--format=csv,noheader,nounits"], capture_output=True, text=True, check=True)
-        manifest["gpu"] = gpu.stdout.strip()
-        stage(gpu.stdout.strip())
-        rows = list(csv.reader(gpu.stdout.splitlines()))
-        if not rows:
-            raise RuntimeError("Không tìm thấy NVIDIA GPU.")
-        # Runtime visibility may remap GPU indices; preserve CUDA_VISIBLE_DEVICES from Molab.
-        if max(float(row[-1]) for row in rows) < 44000 and config["model"] == "gemma4:31b-it-q8_0":
-            raise RuntimeError("Model Q8 mặc định cần nhiều VRAM; hiện không có GPU trống tối thiểu 44.000 MiB. Chọn runtime lớn hơn hoặc model nhỏ hơn.")
-
-        stage("2/6 — Lấy code GitHub và tải FULL dataset")
+        stage("1/5 — Kiểm tra RAM, VRAM và BF16 trước khi tải model")
+        hardware = runtime_probe()
+        manifest["hardware"] = hardware
+        stage(json.dumps(hardware, ensure_ascii=False))
+        require_bf16_hardware(hardware)
+        stage("2/5 — Lấy code GitHub và tải FULL dataset")
         headers = {"Accept": "application/vnd.github+json", "User-Agent": "invoice-ocr-molab"}
         if gh_token:
             headers["Authorization"] = "Bearer " + gh_token
@@ -351,68 +373,32 @@ def run_benchmark(config, progress):
             raise RuntimeError("Ảnh/manifest không hợp lệ; xem plan.log trong ZIP.")
         stage(f"Reviewed: {len(lines)}; lần này chấm {len(selected_lines)} hóa đơn.")
 
-        stage("3/6 — Chuẩn bị Ollama trong cache Molab")
-        install = cache / "ollama" / version
-        binary = install / "bin" / "ollama"
-        if not binary.is_file() or not (install / ".ready").is_file():
-            install.mkdir(parents=True, exist_ok=True)
-            package = install / "ollama.tar.zst"
-            url = ("https://ollama.com/download/ollama-linux-amd64.tar.zst" if version == "latest" else
-                   f"https://github.com/ollama/ollama/releases/download/v{version}/ollama-linux-amd64.tar.zst")
-            download(url, package)
-            stage("Đang giải nén Ollama")
-            with package.open("rb") as raw, zstandard.ZstdDecompressor().stream_reader(raw) as stream:
-                with tarfile.open(fileobj=stream, mode="r|") as tar:
-                    tar.extractall(install, filter="data")
-            binary.chmod(binary.stat().st_mode | 0o111)
-            (install / ".ready").write_text("ok\n", encoding="utf-8")
-            package.unlink()
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        base_url = f"http://127.0.0.1:{port}"
-        server_env = dict(child_env, OLLAMA_HOST=f"127.0.0.1:{port}",
-                          OLLAMA_MODELS=str(cache / "models"), OLLAMA_NUM_PARALLEL="1",
-                          OLLAMA_CONTEXT_LENGTH=str(config["num_ctx"]), OLLAMA_KEEP_ALIVE="30m",
-                          OLLAMA_NO_CLOUD="1")
-        server_log = (output / "ollama-server.log").open("w", encoding="utf-8")
-        server = subprocess.Popen([str(binary), "serve"], env=server_env, stdout=server_log, stderr=subprocess.STDOUT)
-        for attempt in range(120):
-            if server.poll() is not None:
-                raise RuntimeError("Ollama không khởi động được; xem ollama-server.log.")
-            try:
-                manifest["ollama_version"] = api("/api/version", timeout=2)["version"]
-                break
-            except Exception:
-                time.sleep(1)
-        else:
-            raise TimeoutError("Ollama chưa sẵn sàng sau 120 giây.")
-        stage("4/6 — Tải model và kiểm tra GPU (lần đầu có thể mất nhiều phút)")
-        if command([str(binary), "pull", config["model"]], "model-pull.log", env=server_env):
-            raise RuntimeError("Tải model thất bại; xem model-pull.log.")
-        shown = api("/api/show", {"model": config["model"]})
-        if "vision" not in shown.get("capabilities", []):
-            raise ValueError("Model đã chọn không hỗ trợ ảnh.")
-        manifest["model_info"] = shown
-        manifest["installed_models"] = api("/api/tags")
-        stage("Đang nạp model vào GPU; tối đa 1800 giây. Log server: " + str(output / "ollama-server.log"))
-        api("/api/generate", {"model": config["model"], "prompt": "", "stream": False,
-                              "keep_alive": "30m", "options": {"num_ctx": int(config["num_ctx"])}}, timeout=1800)
-        loaded = api("/api/ps").get("models", [])
-        manifest["gpu_preflight"] = loaded
-        if not loaded or not any(m.get("size_vram", 0) > 0 for m in loaded):
-            raise RuntimeError("Model không được load lên GPU. Dừng trước khi benchmark.")
-        manifest["status"] = "extracting"
-        manifest["prompt_sha256"] = hashlib.sha256((checkout / "prompts/invoice.txt").read_bytes()).hexdigest()
+        stage("3/5 — Tải bản gốc Gemma 4 31B từ Hugging Face, BF16, không lượng tử hóa")
+        model_info = HfApi(token=hf_token).model_info(config["model"], revision=config.get("model_ref", "main"), files_metadata=True)
+        model_sha = model_info.sha
+        manifest.update(model_id=config["model"], model_commit=model_sha, weights_format="bf16", backend="transformers")
         save_manifest()
-        stage("5/6 — Trích xuất; log từng hóa đơn sẽ hiện trực tiếp bên dưới")
+        model_folder = cache / "models" / model_sha
+        model_folder.mkdir(parents=True, exist_ok=True)
+        needed = sum(max(0, (item.size or 0) - ((model_folder / item.rfilename).stat().st_size if (model_folder / item.rfilename).is_file() else 0))
+                     for item in model_info.siblings if item.rfilename.endswith(".safetensors"))
+        if shutil.disk_usage(model_folder).free < needed + 2 * 1024**3:
+            raise RuntimeError(f"Thiếu disk để tải weights gốc: cần thêm khoảng {needed / 1024**3:.1f} GiB và 2 GiB dự phòng.")
+        stage(f"Model commit: {model_sha}; cần tải thêm khoảng {needed / 1024**3:.1f} GiB weights.")
+        model_path = Path(snapshot_download(repo_id=config["model"], repo_type="model", revision=model_sha,
+                         token=hf_token, local_dir=str(model_folder),
+                         allow_patterns=["*.safetensors", "*.json", "*.jinja", "*.txt", "*.model", "*.tiktoken"]))
+        manifest["prompt_sha256"] = hashlib.sha256((checkout / "prompts/invoice.txt").read_bytes()).hexdigest()
+        manifest["status"] = "extracting"
+        save_manifest()
+        stage("4/5 — Transformers nạp từng shard BF16 lên cuda:0, batch 1; theo dõi heartbeat và log trực tiếp")
         extraction_started = time.perf_counter()
         exit_code = command([sys.executable, "-m", "invoice_ocr", "extract", "--env-file", str(env_file),
-                             "--backend", "ollama", "--input", str(input_manifest), "--output", str(output / "predictions"),
-                             "--ollama-url", base_url, "--ollama-model", config["model"], "--ollama-device", "auto",
-                             "--ollama-timeout", str(config["timeout"]), "--ollama-num-ctx", str(config["num_ctx"]),
-                             "--ollama-keep-alive", "30m", "--max-edge", str(config["max_edge"]),
-                             "--max-new-tokens", str(config["max_tokens"])], "extract.log")
+                             "--backend", "transformers", "--input", str(input_manifest), "--output", str(output / "predictions"),
+                             "--model", str(model_path), "--revision", model_sha, "--offline", "--device", "cuda:0",
+                             "--weights-format", "bf16", "--max-input-tokens", str(config.get("max_input_tokens", 8192)),
+                             "--vision-soft-tokens", str(config.get("vision_soft_tokens", 1120)),
+                             "--max-edge", str(config["max_edge"]), "--max-new-tokens", str(config["max_tokens"])], "extract.log")
         manifest["extraction_exit_code"] = exit_code
         manifest["extraction_wall_seconds"] = round(time.perf_counter() - extraction_started, 3)
         prediction_dir = output / "predictions"
@@ -426,7 +412,7 @@ def run_benchmark(config, progress):
         for prediction in predictions:
             if prediction.get("status") != "ok":
                 stage(f"LỖI hóa đơn {prediction.get('document_id')}: {prediction.get('error', 'unknown error')}")
-        stage("6/6 — Chấm điểm (hóa đơn lỗi/thiếu vẫn nằm trong mẫu chấm)")
+        stage("5/5 — Chấm điểm (hóa đơn lỗi/thiếu vẫn nằm trong mẫu chấm)")
         if command([sys.executable, "-m", "invoice_ocr", "evaluate", "--groundtruth", str(gt),
                     "--predictions", str(prediction_dir), "--output", str(output / "evaluation")], "evaluate.log"):
             raise RuntimeError("Chấm điểm thất bại; xem evaluate.log.")
@@ -442,44 +428,45 @@ def run_benchmark(config, progress):
             if detail:
                 stage(str(detail))
         (output / "traceback.log").write_text(redact(traceback.format_exc()), encoding="utf-8")
-        for name in ("plan.log", "model-pull.log", "ollama-server.log", "extract.log", "evaluate.log"):
+        for name in ("plan.log", "extract.log", "evaluate.log"):
             path = output / name
             if path.is_file():
                 stage(f"--- {name}: 15 dòng cuối ---\n" + "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]))
     finally:
-        if server is not None and server.poll() is None:
-            server.terminate()
-            try:
-                server.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                server.kill()
-                server.wait()
-        if server_log is not None:
-            server_log.close()
         manifest["total_wall_seconds"] = round(time.perf_counter() - started, 3)
         save_manifest()
         # Results contain reviewed labels and predictions, but never images or tokens.
         for log in output.glob("*.log"):
             content = log.read_text(encoding="utf-8", errors="replace")
             log.write_text(redact(content), encoding="utf-8")
-        bundle_path = Path(shutil.make_archive(str(run / "invoice-results"), "zip", output))
+        bundle_path = Path(shutil.make_archive(str(output.parent / "invoice-results"), "zip", output))
     return {"manifest": manifest, "metrics": metrics, "zip": bundle_path, "directory": output}
 
 
-def install_dependencies():
-    """Install runtime dependencies with visible logs, on explicit notebook call."""
+def install_dependencies(requirements_url, github_token=""):
+    """Keep Molab's working CUDA torch build, install the BF16 backend dependencies."""
     import os
     from pathlib import Path
     import platform
     import sys
+    from urllib.request import Request, urlopen
     if sys.version_info < (3, 12) or platform.system() != "Linux":
         raise RuntimeError("Chọn Linux GPU runtime với Python >= 3.12.")
-    packages = ["huggingface-hub>=0.34,<2", "Pillow>=10,<13", "zstandard>=0.23,<1"]
-    code = stream_command([sys.executable, "-m", "pip", "install", *packages],
+    print("Kiểm tra PyTorch CUDA hiện có; không tự thay CUDA wheel...", flush=True)
+    print(runtime_probe(), flush=True)
+    headers = {"User-Agent": "invoice-ocr-molab"}
+    if github_token:
+        headers["Authorization"] = "Bearer " + github_token
+    print("Tải requirements Molab từ cùng commit GitHub...", flush=True)
+    requirements = Path.cwd() / "molab-requirements.txt"
+    with urlopen(Request(requirements_url, headers=headers), timeout=60) as response:
+        requirements.write_bytes(response.read())
+    code = stream_command([sys.executable, "-m", "pip", "install", "-r", str(requirements)],
                           Path.cwd() / "molab-dependencies.log", print,
                           cwd=Path.cwd(), env=os.environ.copy())
     if code:
         raise RuntimeError("Cài thư viện thất bại; xem log phía trên.")
+    print("Backend Transformers BF16 sẵn sàng.", flush=True)
 
 
 def run_from_notebook(config, github_token=""):
@@ -519,7 +506,7 @@ def show_results(result):
         print("Chưa có kết quả; xem lỗi ở cell chạy.")
         return
     manifest = result["manifest"]
-    keys = ["status", "error", "github_commit", "dataset_commit", "ollama_version",
+    keys = ["status", "error", "github_commit", "dataset_commit", "model_id", "model_commit", "weights_format",
             "reviewed_available", "evaluated_documents", "successful", "failed_or_missing",
             "extraction_wall_seconds", "inference_seconds", "total_wall_seconds"]
     print(json.dumps({k: manifest[k] for k in keys if k in manifest}, ensure_ascii=False, indent=2))

@@ -34,6 +34,8 @@ def extract(args, *, model_loader=None, image_loader=None, client_factory=None):
     else:
         raise ValueError('Unknown extraction backend: ' + str(backend_name))
     identity = None
+    if backend_name == 'transformers' and getattr(args, 'weights_format', 'bnb4') == 'bf16':
+        identity = backend.check_model()  # Fail once at load time instead of repeating a failed 31B load per invoice.
     failures = 0
     for document, target in work:
         record = {'label_format': 'invoice-v3', 'document_id': document.stem if document.is_file() else document.name,
@@ -44,6 +46,12 @@ def extract(args, *, model_loader=None, image_loader=None, client_factory=None):
         if backend_name == 'ollama':
             record['settings'].update(device=args.ollama_device, num_ctx=args.ollama_num_ctx,
                                       num_threads=args.ollama_num_threads, temperature=0, seed=42)
+        else:
+            record['settings'].update(weights_format=getattr(args, 'weights_format', 'bnb4'),
+                                      device=getattr(args, 'device', None), do_sample=False,
+                                      max_input_tokens=getattr(args, 'max_input_tokens', None))
+            if getattr(args, 'weights_format', 'bnb4') == 'bf16':
+                record['settings'].update(thinking=False, vision_soft_tokens=getattr(args, 'vision_soft_tokens', 1120))
         frames = []
         try:
             record['images'] = [{'file': path.name, 'sha256': file_sha256(path)} for path in image_paths(document)]
@@ -54,6 +62,7 @@ def extract(args, *, model_loader=None, image_loader=None, client_factory=None):
             frames = (image_loader or load_images)(document, args.max_edge)
             if len(frames) != len(record['images']):
                 raise ValueError('All invoice images must be provided together')
+            print(f"processing {record['document_id']}: {len(frames)} page(s)", flush=True)
             started = time.perf_counter()
             response = backend.generate(frames, prompt)
             record['inference_seconds'] = response.get('inference_seconds', round(time.perf_counter() - started, 3))

@@ -6,6 +6,7 @@ build/
 dist/
 models/
 outputs/
+/invoice-results/
 .env
 .env.*
 !.env.example

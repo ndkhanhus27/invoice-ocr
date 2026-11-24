@@ -103,6 +103,24 @@ print('finished', flush=True)
         self.assertIn("benchmark.run_from_notebook(CONFIG", source)
         self.assertNotIn("def run_benchmark(", source)
         self.assertNotIn("import marimo", source)
+        self.assertIn('"model": "google/gemma-4-31B-it"', source)
+        self.assertIn('"weights_format": "bf16"', source)
+        self.assertNotIn("ollama_version", source)
+
+    def test_original_model_stops_on_32_gib_vram(self):
+        path = Path(__file__).resolve().parents[1] / "scripts/molab_benchmark.py"
+        scope = {}
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), scope)
+        with self.assertRaisesRegex(RuntimeError, "80 GiB"):
+            scope["require_bf16_hardware"]({"bf16": True, "vram_free_gib": 32})
+        scope["require_bf16_hardware"]({"bf16": True, "vram_free_gib": 90})
+
+    def test_old_ollama_config_is_not_silently_used(self):
+        path = Path(__file__).resolve().parents[1] / "scripts/molab_benchmark.py"
+        scope = {}
+        exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), scope)
+        with self.assertRaisesRegex(ValueError, "bản gốc"):
+            scope["validate_bf16_config"]({"model": "gemma4:31b-it-q8_0"})
 
 
 class MolabImageCacheTests(unittest.TestCase):

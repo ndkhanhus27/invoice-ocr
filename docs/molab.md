@@ -1,37 +1,81 @@
-# Molab: notebook gọi scripts từ GitHub
+# Molab — Gemma 4 31B bản gốc BF16
 
-Notebook: `notebooks/molab_gemma4.ipynb`. Phần xử lý nằm tại
-`scripts/molab_benchmark.py`, tải từ GitHub khi chạy cell lấy code.
+Chạy `notebooks/molab_gemma4.ipynb`. Notebook ngắn, lấy
+`scripts/molab_benchmark.py` từ GitHub. Phiên bản này dùng **Transformers +
+PyTorch**, model chính thức **google/gemma-4-31B-it**, dtype **BF16**.
+Không cài/chạy Ollama, không tải GGUF và không lượng tử hóa.
 
-1. Push notebook và script lên GitHub.
-2. Import file `.ipynb` vào runtime Linux NVIDIA GPU, Python >= 3.12.
-3. Sửa CONFIG: `valid`, `limit=3` chạy thử; `limit=0` chạy toàn bộ reviewed.
-4. Chạy lần lượt: cấu hình → lấy script → cài thư viện → benchmark → kết quả.
-5. Nhập HF token khi được hỏi (ô ẩn), hoặc đặt secret `HF_TOKEN` trước.
-   Repo code private: `GITHUB_PRIVATE=True`, nhập token hoặc đặt `GITHUB_TOKEN`.
-6. Tải ZIP trước khi runtime bị thu hồi. Nếu link không hoạt động, lấy file trong
-   thư mục `invoice-results/` bằng trình duyệt file của runtime.
+## Chạy từng bước
 
-Script tự lấy code cùng commit, tải full HF dataset private và Ollama/model.
-Ảnh trong snapshot HF có thể là symlink tới `blobs/`. Script tạo `data/` bằng
-hardlink tới file thật (copy nếu khác filesystem), giữ nguyên nội dung/hash và
-quy tắc kiểm tra đường dẫn của pipeline. Không cần upload lại chỉ vì symlink cache.
-Nếu ảnh thực sự thiếu, script báo tên file và yêu cầu upload đúng đường dẫn.
-Ưu tiên `groundtruth/reviewed/<split>.jsonl`. Nếu file export chưa được upload,
-script chỉ lấy các dòng `review_status="reviewed"` không có `editor_draft` từ
-`groundtruth/annotations/<split>.jsonl`. Không dùng nhãn chưa review. Nguồn nhãn
-và cách chọn được ghi trong run manifest; nếu thiếu cả hai nguồn, dừng và hướng
-dẫn upload file reviewed lên HF.
-Mặc định Gemma 4 31B Q8, chỉ chấm groundtruth reviewed của valid. Không cần DB.
-Chỉ mở notebook không chạy model; chạy cell benchmark mới bắt đầu xử lý.
+1. Push notebook, script, backend và requirements mới lên GitHub.
+2. Import lại file `.ipynb` mới trên Molab. Bản cũ có tên model Ollama sẽ bị từ chối.
+3. Chọn Linux GPU, Python >= 3.12. Chạy cell cấu hình, giữ valid/limit=3 để thử.
+4. Chạy cell lấy script từ GitHub rồi cell cài thư viện. Requirements lấy cùng commit.
+5. Chạy cell benchmark, nhập HF token qua ô ẩn hoặc đặt secret HF_TOKEN.
+6. Chạy cell kết quả và tải ZIP. Đổi limit=0 khi muốn chạy hết phần reviewed.
 
-Log hiện trực tiếp, có heartbeat subprocess mỗi 15 giây, traceback và log cuối
-khi lỗi. ZIP có predictions, groundtruth đã chọn, metrics, errors, log và phiên
-bản code/data/model. Không tự upload kết quả. Token không ghi vào ZIP/source.
-Nếu reviewed chưa phủ hết split, điểm chỉ đại diện phần reviewed. Lỗi trích xuất
-vẫn tính trong mẫu chấm. Ngưỡng VRAM là kiểm tra sơ bộ; xem server log/offload
-trong run manifest khi đo hiệu năng. Ollama dừng sau run, cache giữ khi còn disk.
+Repo code private: GITHUB_PRIVATE=True, nhập GitHub token khi được hỏi hoặc đặt
+secret GITHUB_TOKEN. Không dán token vào source, không gửi token trong chat.
 
-Notebook tải script ở commit được resolve từ REF (`main` mặc định). Push cập nhật
-script rồi chạy lại cell lấy code để dùng bản mới; không cần nhúng code vào notebook.
-Bản marimo `.py` cũ vẫn được giữ lại, không cần dùng cho luồng này.
+## Kiểm tra phần cứng trước khi tải weights
+
+32 GiB hiển thị trên Molab là RAM hệ thống; VRAM được đo từ PyTorch CUDA.
+RTX PRO 6000 của Molab được công bố có 96 GB VRAM. Script kiểm tra cuda:0 và yêu cầu
+BF16 cùng tối thiểu 80 GiB VRAM còn trống. Đây là ngưỡng sơ bộ cho cấu hình mặc định,
+không bảo đảm mọi hóa đơn/context đều vừa. Nếu chỉ có GPU 32 GiB VRAM, script dừng
+trước khi tải model. Không tự chuyển model hoặc offload lên CPU/disk.
+
+Nguồn Google ước tính Gemma 4 31B BF16 cần khoảng 69.9 GB cho weights/loading;
+context và phần chạy có thể cần thêm. HF weights gốc có thể cần hơn 60 GB disk;
+script dùng metadata repo để kiểm tra dung lượng trước khi tải. Cache Ollama cũ
+vẫn được giữ nguyên, không tự xóa; dung lượng đó có thể làm thiếu chỗ tải bản mới.
+
+Nguồn tham khảo:
+- https://gemma.ai/models/gemma-4/#gemma-4-inference-memory-requirements
+- https://huggingface.co/google/gemma-4-31B-it
+- https://docs.marimo.io/guides/molab/#compute
+
+## Backend và cấu hình
+
+requirements/molab.txt dành riêng runtime Molab: Transformers 5.24.0, Accelerate,
+HF Hub, Safetensors và Pillow. Dùng CUDA torch/torchvision sẵn có của Molab;
+kiểm tra trước khi cài, không tự thay CUDA wheel. Không cài requirements/gpu.txt
+cũ vào runtime này: file đó phục vụ nhánh local checkpoint 4-bit.
+
+Model được tải từ repo chính thức ở commit đã resolve; các shard safetensors
+được đọc lần lượt bằng low_cpu_mem_usage=True, nạp một lần trên cuda:0 trong
+tiến trình worker Python. Kernel notebook không chứa model. Không dùng auto
+device map để tránh vô tình offload weights gốc sang RAM 32 GiB.
+
+Mặc định batch 1, max_input_tokens=8192, max_tokens=4096, max_edge=1600,
+vision_soft_tokens=1120 cho đọc chữ nhỏ. Thinking tắt, do_sample=False để dễ
+so sánh các lần chạy. Nếu input vượt giới hạn, hóa đơn báo lỗi thay vì bỏ trang.
+Nhiều trang/đầu ra dài vẫn có thể hết VRAM; tăng tham số phải kiểm tra bộ nhớ.
+Giữ nguyên prompt, schema, pipeline và scorer. Backend local bnb4 vẫn có sẵn;
+BF16 là lựa chọn rõ ràng qua --weights-format bf16, không thay ngầm local config.
+
+## Dữ liệu, log và kết quả
+
+Tải full dataset HF private vào cache. Chỉ chấm reviewed của split đã chọn.
+Ưu tiên groundtruth/reviewed/<split>.jsonl; nếu thiếu file export, chỉ lấy dòng
+review_status=reviewed không có editor_draft từ annotations. Không dùng nhãn draft.
+Ảnh snapshot HF được nối bằng hardlink/copy để vượt lỗi symlink blobs, vẫn kiểm
+tra đầy đủ hash và thứ tự ảnh. Nếu ảnh thực sự thiếu, báo tên file cần upload.
+
+Code/dataset/model đều được ghim commit SHA trong mỗi run. Predictions được ghi
+ngay từng hóa đơn bằng cơ chế atomic của pipeline. Log stdout/stderr hiện trực
+tiếp, có heartbeat khi worker im lặng. Tiến trình bị lỗi/kill vẫn giữ file đã ghi;
+các prediction lỗi/thiếu vẫn tính khi scorer chạy được.
+
+Kết quả ở invoice-results/<run-id>/results/ ngay trong working directory:
+predictions, groundtruth đã chọn, metrics.csv, errors.csv, run_manifest.json và log.
+Run manifest được cập nhật theo từng dòng tiến độ. ZIP được tạo khi kết thúc
+bình thường hoặc gặp exception xử lý được. Kernel/container bị kill cứng có thể
+không tạo ZIP; khi file còn trên disk có thể tải cả thư mục qua file browser.
+
+**Đây vẫn là file local trong runtime, không phải lưu trữ bền vững.** Molab thay
+container có thể làm mất file. Tải kết quả về hoặc tự lưu vào remote storage để
+giữ qua lần reset. Notebook không tự upload dữ liệu/kết quả ra dịch vụ khác.
+Không tuyên bố đã xác định nguyên nhân lần mất output trước nếu chưa có OOM log.
+
+Các notebook/file marimo .py cũ chưa xóa, không dùng trong luồng BF16 này.

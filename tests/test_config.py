@@ -45,6 +45,13 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(fake_download.call_args.kwargs["repo_id"], "org/other-bnb-4bit")
         self.assertEqual(fake_download.call_args.kwargs["local_dir"], str(ROOT / "models/other-bnb-4bit"))
 
+    def test_bf16_and_image_budget_are_explicit(self):
+        args = config.parse_args(["extract", "--env-file", str(self.env), "--weights-format", "bf16",
+                                  "--max-input-tokens", "8192", "--vision-soft-tokens", "1120"])
+        self.assertEqual(args.weights_format, "bf16")
+        self.assertEqual(args.max_input_tokens, 8192)
+        self.assertEqual(args.vision_soft_tokens, 1120)
+
     def test_explicit_missing_file_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Config file does not exist"):
             config.parse_args(["plan", "--env-file", str(self.env.parent / "missing.env")])

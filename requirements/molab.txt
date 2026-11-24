@@ -1,0 +1,6 @@
+# Molab already supplies its CUDA-enabled torch/torchvision build. Do not replace it blindly.
+transformers==5.24.0
+accelerate>=1.10,<2
+huggingface-hub>=1,<2
+Pillow>=10,<13
+safetensors>=0.6,<1
