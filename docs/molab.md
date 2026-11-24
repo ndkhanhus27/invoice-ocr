@@ -13,6 +13,15 @@ Notebook: `notebooks/molab_gemma4.ipynb`. Phần xử lý nằm tại
    thư mục `invoice-results/` bằng trình duyệt file của runtime.
 
 Script tự lấy code cùng commit, tải full HF dataset private và Ollama/model.
+Ảnh trong snapshot HF có thể là symlink tới `blobs/`. Script tạo `data/` bằng
+hardlink tới file thật (copy nếu khác filesystem), giữ nguyên nội dung/hash và
+quy tắc kiểm tra đường dẫn của pipeline. Không cần upload lại chỉ vì symlink cache.
+Nếu ảnh thực sự thiếu, script báo tên file và yêu cầu upload đúng đường dẫn.
+Ưu tiên `groundtruth/reviewed/<split>.jsonl`. Nếu file export chưa được upload,
+script chỉ lấy các dòng `review_status="reviewed"` không có `editor_draft` từ
+`groundtruth/annotations/<split>.jsonl`. Không dùng nhãn chưa review. Nguồn nhãn
+và cách chọn được ghi trong run manifest; nếu thiếu cả hai nguồn, dừng và hướng
+dẫn upload file reviewed lên HF.
 Mặc định Gemma 4 31B Q8, chỉ chấm groundtruth reviewed của valid. Không cần DB.
 Chỉ mở notebook không chạy model; chạy cell benchmark mới bắt đầu xử lý.
 

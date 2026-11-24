@@ -69,6 +69,82 @@ def stream_command(args, log_path, emit, *, cwd, env, timeout=None,
         process.stdout.close()
 
 
+def load_reviewed_groundtruth(dataset, split, emit):
+    """Prefer exported reviewed labels; otherwise use explicitly reviewed annotations only."""
+    import json
+    from pathlib import Path
+    if split not in ("train", "valid", "test"):
+        raise ValueError("Split phải là train, valid hoặc test.")
+    dataset = Path(dataset)
+    reviewed = dataset / "groundtruth" / "reviewed" / (split + ".jsonl")
+    annotations = dataset / "groundtruth" / "annotations" / (split + ".jsonl")
+    if reviewed.is_file():
+        source = reviewed
+        lines = [line for line in source.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    elif annotations.is_file():
+        source = annotations
+        lines = []
+        for line in source.read_text(encoding="utf-8-sig").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("review_status") == "reviewed" and "editor_draft" not in record:
+                lines.append(line)  # Preserve numeric literals without float round-tripping.
+        emit(f"Thiếu {reviewed.relative_to(dataset)}; lấy {len(lines)} hóa đơn có review_status=reviewed từ {source.relative_to(dataset)}.")
+    else:
+        available = ", ".join(str(p.relative_to(dataset)) for p in sorted((dataset / "groundtruth").rglob("*.jsonl"))) or "không có JSONL"
+        raise FileNotFoundError(f"Dataset thiếu groundtruth cho {split}. Cần {reviewed.relative_to(dataset)} hoặc {annotations.relative_to(dataset)} có review_status=reviewed. Hiện có: {available}. Hãy upload groundtruth/reviewed/{split}.jsonl lên HF rồi chạy lại với dataset_ref=main.")
+    if not lines:
+        raise ValueError(f"{source.relative_to(dataset)} không có hóa đơn reviewed để chấm; cần review/export nhãn rồi cập nhật HF.")
+    emit(f"Groundtruth: {source.relative_to(dataset)} — {len(lines)} hóa đơn reviewed.")
+    return source, lines
+
+
+def materialize_image_tree(source, destination, emit):
+    """HF snapshot files point outside data/; create ordinary files without changing guards."""
+    import os
+    from pathlib import Path
+    import shutil
+    import time
+    counts = {"hardlinked": 0, "copied": 0}
+    last_report = time.monotonic()
+
+    def link_or_copy(src, dst):
+        nonlocal last_report
+        resolved = Path(src).resolve(strict=True)
+        try:
+            os.link(resolved, dst)
+            counts["hardlinked"] += 1
+        except OSError:
+            shutil.copyfile(resolved, dst)
+            counts["copied"] += 1
+        if time.monotonic() - last_report >= 15:
+            emit(f"Đang chuẩn bị ảnh: {sum(counts.values())} file")
+            last_report = time.monotonic()
+        return dst
+
+    emit("Chuẩn bị data/ từ HF cache: hardlink file thật; copy nếu khác filesystem.")
+    shutil.copytree(source, destination, symlinks=False, copy_function=link_or_copy)
+    emit(f"Đã chuẩn bị ảnh: {counts['hardlinked']} hardlink, {counts['copied']} copy.")
+    return counts
+
+
+def verify_image_files(root, records):
+    """Report absent uploads separately from cache symlink containment errors."""
+    from pathlib import Path, PurePosixPath
+    missing = []
+    for record in records:
+        for image in record.get("images", []):
+            name = image if isinstance(image, str) else image.get("file", "")
+            relative = PurePosixPath(name)
+            if relative.is_absolute() or ".." in relative.parts or not relative.parts or relative.parts[0] != "data" or "\\" in name:
+                raise ValueError("Đường dẫn ảnh không hợp lệ trong groundtruth: " + name)
+            if not (Path(root) / name).is_file():
+                missing.append(name)
+    if missing:
+        raise FileNotFoundError(f"Dataset thiếu {len(missing)} ảnh được groundtruth tham chiếu. Ví dụ: {', '.join(missing[:5])}. Upload các ảnh này vào đúng data/<split>/<document_id>/ trên HF rồi chạy lại.")
+
+
 def run_benchmark(config, progress):
     """Isolate downloaded project imports in subprocesses, not the notebook kernel."""
     import csv
@@ -241,10 +317,13 @@ def run_benchmark(config, progress):
             if source.exists():
                 if (checkout / name).exists():
                     raise ValueError("GitHub chứa thư mục dữ liệu " + name + "; cần tách data sang HF.")
-                (checkout / name).symlink_to(source, target_is_directory=True)
-        source_gt = dataset / "groundtruth" / "reviewed" / (config["split"] + ".jsonl")
-        # Keep original JSON lines verbatim: Decimal labels must not round through float.
-        lines = [line for line in source_gt.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+                if name == "data":
+                    manifest["image_materialization"] = materialize_image_tree(source, checkout / name, stage)
+                else:
+                    (checkout / name).symlink_to(source, target_is_directory=True)
+        source_gt, lines = load_reviewed_groundtruth(dataset, config["split"], stage)
+        manifest["groundtruth_source"] = source_gt.relative_to(dataset).as_posix()
+        manifest["groundtruth_selection"] = "explicit_reviewed_status" if source_gt.parent.name == "annotations" else "reviewed_export"
         records = [json.loads(line) for line in lines]
         if not records or any(row.get("review_status", "reviewed") != "reviewed" or "editor_draft" in row or "annotation" not in row for row in records):
             raise ValueError("Tập này chưa có groundtruth reviewed hợp lệ. Hãy chọn valid đã review.")
@@ -253,6 +332,7 @@ def run_benchmark(config, progress):
             raise ValueError("Groundtruth bị trùng document_id.")
         count = int(config["limit"]) or len(lines)
         selected_lines = lines[:count]
+        verify_image_files(checkout, records[:count])
         manifest.update(reviewed_available=len(lines), evaluated_documents=len(selected_lines), document_ids=ids[:count])
         annotations = dataset / "groundtruth" / "annotations" / (config["split"] + ".jsonl")
         if annotations.exists():
